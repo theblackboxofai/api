@@ -39,3 +39,25 @@ CREATE TABLE IF NOT EXISTS server_models (
 
 CREATE INDEX IF NOT EXISTS idx_server_models_server_scan_id
     ON server_models (server_scan_id);
+
+CREATE TABLE IF NOT EXISTS logs (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    request_id TEXT NOT NULL,
+    requested_model TEXT NOT NULL,
+    raw_model_id TEXT NOT NULL,
+    server_url TEXT NOT NULL,
+    stream BOOLEAN NOT NULL DEFAULT FALSE,
+    success BOOLEAN NOT NULL DEFAULT FALSE,
+    response_status INTEGER,
+    request_json JSONB NOT NULL,
+    response_headers JSONB,
+    response_body TEXT,
+    error_text TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_logs_server_url_success_created_at
+    ON logs (server_url, success, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_logs_request_id
+    ON logs (request_id);

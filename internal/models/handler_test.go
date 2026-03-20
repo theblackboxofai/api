@@ -73,11 +73,64 @@ func TestHandlerReturnsOpenAIListShapeAndFiltersNonCloudModels(t *testing.T) {
 	}
 }
 
+func TestStatsHandlerReturnsMappedServerCounts(t *testing.T) {
+	t.Parallel()
+
+	repo := fakeRepository{
+		stats: []StatRecord{
+			{ID: "alpha:cloud", ServerCount: 3},
+			{ID: "beta", ServerCount: 99},
+			{ID: "gamma:cloud", ServerCount: 1},
+		},
+	}
+
+	handler := NewStatsHandler(NewService(repo, "blackbox", StaticModelMapper{
+		models: map[string]string{
+			"alpha:cloud": "provider/alpha",
+			"gamma:cloud": "provider/gamma",
+		},
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	var response StatsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if response.Object != "list" {
+		t.Fatalf("expected object=list, got %q", response.Object)
+	}
+
+	if len(response.Data) != 2 {
+		t.Fatalf("expected 2 cloud stats, got %d", len(response.Data))
+	}
+
+	if response.Data[0].ID != "provider/alpha" || response.Data[0].ServerCount != 3 {
+		t.Fatalf("expected provider/alpha count 3, got %#v", response.Data[0])
+	}
+
+	if response.Data[1].ID != "provider/gamma" || response.Data[1].ServerCount != 1 {
+		t.Fatalf("expected provider/gamma count 1, got %#v", response.Data[1])
+	}
+}
+
 type fakeRepository struct {
 	records []Record
+	stats   []StatRecord
 	err     error
 }
 
 func (f fakeRepository) ListCloudModels(context.Context) ([]Record, error) {
 	return f.records, f.err
+}
+
+func (f fakeRepository) ListCloudModelStats(context.Context) ([]StatRecord, error) {
+	return f.stats, f.err
 }

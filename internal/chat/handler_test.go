@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"blackbox-api/internal/models"
@@ -17,7 +18,7 @@ import (
 func TestHandlerRejectsUnknownModel(t *testing.T) {
 	t.Parallel()
 
-	service := NewService(fakeRepository{}, models.StaticModelMapper{})
+	service := NewService(&fakeRepository{}, models.StaticModelMapper{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"unknown/model","messages":[]}`))
 	rec := httptest.NewRecorder()
 
@@ -31,7 +32,7 @@ func TestHandlerRejectsUnknownModel(t *testing.T) {
 func TestHandlerRejectsUnsupportedField(t *testing.T) {
 	t.Parallel()
 
-	service := NewService(fakeRepository{}, models.StaticModelMapper{})
+	service := NewService(&fakeRepository{}, models.StaticModelMapper{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v3.2","messages":[],"foo":"bar"}`))
 	rec := httptest.NewRecorder()
 
@@ -305,7 +306,8 @@ func TestDoUpstreamRequestRetriesAnotherServerOnFailure(t *testing.T) {
 	t.Parallel()
 
 	var calls []string
-	service := NewService(fakeRepository{}, models.StaticModelMapper{})
+	repo := &fakeRepository{}
+	service := NewService(repo, models.StaticModelMapper{})
 	service.client = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			calls = append(calls, req.URL.String())
@@ -331,7 +333,7 @@ func TestDoUpstreamRequestRetriesAnotherServerOnFailure(t *testing.T) {
 		}),
 	}
 
-	resp, err := service.doUpstreamRequest(context.Background(), []string{"http://server-a", "http://server-b"}, http.Header{}, []byte(`{"model":"x"}`))
+	resp, serverURL, err := service.doUpstreamRequest(context.Background(), []string{"http://server-a", "http://server-b"}, http.Header{}, []byte(`{"model":"alpha:cloud"}`), []byte(`{"model":"alpha:cloud"}`), "req-1", "alpha:cloud", "alpha:cloud", false)
 	if err != nil {
 		t.Fatalf("doUpstreamRequest: %v", err)
 	}
@@ -344,13 +346,30 @@ func TestDoUpstreamRequestRetriesAnotherServerOnFailure(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("expected 2 upstream attempts, got %d", len(calls))
 	}
+
+	if serverURL != "http://server-b" {
+		t.Fatalf("expected second server to succeed, got %q", serverURL)
+	}
+
+	if len(repo.logs) != 1 {
+		t.Fatalf("expected one failed retry log, got %d", len(repo.logs))
+	}
+
+	if repo.logs[0].ServerURL != "http://server-a" || repo.logs[0].Success {
+		t.Fatalf("expected failed log for server-a, got %#v", repo.logs[0])
+	}
+
+	if repo.logs[0].RequestJSON != `{"model":"alpha:cloud"}` {
+		t.Fatalf("expected original request JSON in log, got %q", repo.logs[0].RequestJSON)
+	}
 }
 
 func TestDoUpstreamRequestRetriesAfterTransportError(t *testing.T) {
 	t.Parallel()
 
 	attempts := 0
-	service := NewService(fakeRepository{}, models.StaticModelMapper{})
+	repo := &fakeRepository{}
+	service := NewService(repo, models.StaticModelMapper{})
 	service.client = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			attempts++
@@ -367,7 +386,7 @@ func TestDoUpstreamRequestRetriesAfterTransportError(t *testing.T) {
 		}),
 	}
 
-	resp, err := service.doUpstreamRequest(context.Background(), []string{"http://server-a", "http://server-b"}, http.Header{}, []byte(`{"model":"x"}`))
+	resp, _, err := service.doUpstreamRequest(context.Background(), []string{"http://server-a", "http://server-b"}, http.Header{}, []byte(`{"model":"alpha:cloud"}`), []byte(`{"model":"alpha:cloud"}`), "req-1", "alpha:cloud", "alpha:cloud", false)
 	if err != nil {
 		t.Fatalf("doUpstreamRequest: %v", err)
 	}
@@ -376,15 +395,66 @@ func TestDoUpstreamRequestRetriesAfterTransportError(t *testing.T) {
 	if attempts != 2 {
 		t.Fatalf("expected 2 attempts, got %d", attempts)
 	}
+
+	if len(repo.logs) != 1 || !strings.Contains(repo.logs[0].ErrorText, "deadline") {
+		t.Fatalf("expected transport failure log, got %#v", repo.logs)
+	}
+}
+
+func TestHandleCompletionsLogsSuccessfulRequest(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeRepository{servers: []string{"http://server-a"}}
+	service := NewService(repo, models.StaticModelMapper{})
+	service.client = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","model":"alpha:cloud","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alpha:cloud","messages":[]}`))
+	rec := httptest.NewRecorder()
+
+	service.HandleCompletions(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	if len(repo.logs) != 1 {
+		t.Fatalf("expected one success log, got %d", len(repo.logs))
+	}
+
+	if !repo.logs[0].Success || repo.logs[0].ServerURL != "http://server-a" {
+		t.Fatalf("expected successful log for server-a, got %#v", repo.logs[0])
+	}
+
+	if !strings.Contains(repo.logs[0].ResponseBody, `"content":"ok"`) {
+		t.Fatalf("expected response body in log, got %q", repo.logs[0].ResponseBody)
+	}
 }
 
 type fakeRepository struct {
+	mu      sync.Mutex
 	servers []string
+	logs    []LogEntry
 	err     error
 }
 
-func (f fakeRepository) ListCandidateServers(context.Context, string) ([]string, error) {
+func (f *fakeRepository) ListCandidateServers(context.Context, string) ([]string, error) {
 	return f.servers, f.err
+}
+
+func (f *fakeRepository) InsertLog(_ context.Context, entry LogEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logs = append(f.logs, entry)
+	return nil
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

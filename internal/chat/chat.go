@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand/v2"
 	"net/http"
 	"strings"
+	"time"
 
 	"blackbox-api/internal/models"
 )
@@ -48,12 +50,28 @@ var allowedStreamOptionsFields = map[string]struct{}{
 
 type Repository interface {
 	ListCandidateServers(ctx context.Context, rawModelID string) ([]string, error)
+	InsertLog(ctx context.Context, entry LogEntry) error
 }
 
 type Service struct {
 	client *http.Client
+	debug  bool
 	mapper models.ModelMapper
 	repo   Repository
+}
+
+type LogEntry struct {
+	RequestID       string
+	RequestedModel  string
+	RawModelID      string
+	ServerURL       string
+	Stream          bool
+	Success         bool
+	ResponseStatus  int
+	RequestJSON     string
+	ResponseHeaders string
+	ResponseBody    string
+	ErrorText       string
 }
 
 type chatCompletionRequest struct {
@@ -82,7 +100,13 @@ func NewService(repo Repository, mapper models.ModelMapper) *Service {
 	}
 }
 
+func (s *Service) WithDebug(enabled bool) *Service {
+	s.debug = enabled
+	return s
+}
+
 func (s *Service) HandleCompletions(w http.ResponseWriter, r *http.Request) {
+	s.debugf("incoming chat completion request")
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
@@ -97,6 +121,7 @@ func (s *Service) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 
 	request, err := validateChatCompletionRequest(body)
 	if err != nil {
+		s.debugf("request validation failed: %v", err)
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -108,12 +133,15 @@ func (s *Service) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 
 	rawModelID, ok := s.mapper.LookupRaw(request.Model)
 	if !ok || !strings.Contains(rawModelID, models.CloudTag) {
+		s.debugf("requested model %q not available", request.Model)
 		writeError(w, http.StatusNotFound, "invalid_request_error", "requested model is not available")
 		return
 	}
+	s.debugf("resolved model %q to raw %q", request.Model, rawModelID)
 
 	serverURLs, err := s.pickServers(r.Context(), rawModelID)
 	if err != nil {
+		s.debugf("server selection failed for %q: %v", rawModelID, err)
 		if err == errModelUnavailable {
 			writeError(w, http.StatusNotFound, "invalid_request_error", "requested model is not available")
 			return
@@ -129,21 +157,55 @@ func (s *Service) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamResp, err := s.doUpstreamRequest(r.Context(), serverURLs, r.Header, upstreamBody)
+	requestID := newRequestID()
+	s.debugf("request %s trying %d candidate servers", requestID, len(serverURLs))
+	upstreamResp, serverURL, err := s.doUpstreamRequest(r.Context(), serverURLs, r.Header, body, upstreamBody, requestID, request.Model, rawModelID, request.Stream)
 	if err != nil {
+		s.debugf("request %s upstream failed: %v", requestID, err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "failed to call upstream server")
 		return
 	}
 	defer upstreamResp.Body.Close()
+	s.debugf("request %s using server %s status=%d", requestID, serverURL, upstreamResp.StatusCode)
 
 	if strings.HasPrefix(upstreamResp.Header.Get("Content-Type"), "text/event-stream") {
-		if err := proxyStreamResponse(w, upstreamResp, request.Model); err != nil && !errors.Is(err, context.Canceled) {
+		responseBody, streamErr := proxyStreamResponse(w, upstreamResp, request.Model)
+		s.logAttempt(r.Context(), LogEntry{
+			RequestID:       requestID,
+			RequestedModel:  request.Model,
+			RawModelID:      rawModelID,
+			ServerURL:       serverURL,
+			Stream:          true,
+			Success:         streamErr == nil,
+			ResponseStatus:  upstreamResp.StatusCode,
+			RequestJSON:     string(body),
+			ResponseHeaders: marshalHeaders(upstreamResp.Header),
+			ResponseBody:    string(responseBody),
+			ErrorText:       errorString(streamErr),
+		})
+		s.debugf("request %s streamed response success=%t bytes=%d", requestID, streamErr == nil, len(responseBody))
+		if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
 			return
 		}
 		return
 	}
 
-	if err := proxyJSONResponse(w, upstreamResp, request.Model); err != nil {
+	responseBody, proxyErr := proxyJSONResponse(w, upstreamResp, request.Model)
+	s.logAttempt(r.Context(), LogEntry{
+		RequestID:       requestID,
+		RequestedModel:  request.Model,
+		RawModelID:      rawModelID,
+		ServerURL:       serverURL,
+		Stream:          false,
+		Success:         proxyErr == nil && upstreamResp.StatusCode >= 200 && upstreamResp.StatusCode < 300,
+		ResponseStatus:  upstreamResp.StatusCode,
+		RequestJSON:     string(body),
+		ResponseHeaders: marshalHeaders(upstreamResp.Header),
+		ResponseBody:    string(responseBody),
+		ErrorText:       errorString(proxyErr),
+	})
+	s.debugf("request %s completed success=%t bytes=%d", requestID, proxyErr == nil && upstreamResp.StatusCode >= 200 && upstreamResp.StatusCode < 300, len(responseBody))
+	if proxyErr != nil {
 		if upstreamResp.StatusCode >= 200 && upstreamResp.StatusCode < 300 {
 			writeError(w, http.StatusBadGateway, "upstream_error", "failed to decode upstream response")
 			return
@@ -165,7 +227,9 @@ func (s *Service) pickServers(ctx context.Context, rawModelID string) ([]string,
 		return nil, errModelUnavailable
 	}
 
-	return shuffleServers(servers), nil
+	shuffled := shuffleServers(servers)
+	s.debugf("selected %d candidate servers for %q", len(shuffled), rawModelID)
+	return shuffled, nil
 }
 
 func rewriteRequestModel(body []byte, rawModelID string) ([]byte, error) {
@@ -179,14 +243,14 @@ func rewriteRequestModel(body []byte, rawModelID string) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-func (s *Service) doUpstreamRequest(ctx context.Context, serverURLs []string, requestHeaders http.Header, body []byte) (*http.Response, error) {
+func (s *Service) doUpstreamRequest(ctx context.Context, serverURLs []string, requestHeaders http.Header, requestBody, upstreamBody []byte, requestID, requestedModel, rawModelID string, stream bool) (*http.Response, string, error) {
 	var lastErr error
-	var lastResp *http.Response
 
 	for i, serverURL := range serverURLs {
-		upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(serverURL, ollamaChatCompletionsPath), bytes.NewReader(body))
+		s.debugf("request %s upstream attempt %d/%d server=%s", requestID, i+1, len(serverURLs), serverURL)
+		upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(serverURL, ollamaChatCompletionsPath), bytes.NewReader(upstreamBody))
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
 		copyRequestHeaders(upstreamReq.Header, requestHeaders)
@@ -197,33 +261,56 @@ func (s *Service) doUpstreamRequest(ctx context.Context, serverURLs []string, re
 
 		upstreamResp, err := s.client.Do(upstreamReq)
 		if err != nil {
+			s.debugf("request %s transport error from %s: %v", requestID, serverURL, err)
+			s.logAttempt(ctx, LogEntry{
+				RequestID:      requestID,
+				RequestedModel: requestedModel,
+				RawModelID:     rawModelID,
+				ServerURL:      serverURL,
+				Stream:         stream,
+				Success:        false,
+				RequestJSON:    string(requestBody),
+				ErrorText:      err.Error(),
+			})
 			lastErr = err
 			continue
 		}
 
 		if upstreamResp.StatusCode >= 200 && upstreamResp.StatusCode < 300 {
-			if lastResp != nil && lastResp.Body != nil {
-				lastResp.Body.Close()
-			}
-			return upstreamResp, nil
+			s.debugf("request %s successful upstream from %s", requestID, serverURL)
+			return upstreamResp, serverURL, nil
 		}
 
 		if !shouldRetryStatus(upstreamResp.StatusCode) || i == len(serverURLs)-1 {
-			if lastResp != nil && lastResp.Body != nil {
-				lastResp.Body.Close()
-			}
-			return upstreamResp, nil
+			s.debugf("request %s returning non-retryable/final status %d from %s", requestID, upstreamResp.StatusCode, serverURL)
+			return upstreamResp, serverURL, nil
 		}
 
-		if lastResp != nil && lastResp.Body != nil {
-			lastResp.Body.Close()
-		}
-		lastResp = upstreamResp
-		lastErr = fmt.Errorf("upstream status %d", upstreamResp.StatusCode)
+		responseBody, readErr := io.ReadAll(upstreamResp.Body)
 		upstreamResp.Body.Close()
+		s.logAttempt(ctx, LogEntry{
+			RequestID:       requestID,
+			RequestedModel:  requestedModel,
+			RawModelID:      rawModelID,
+			ServerURL:       serverURL,
+			Stream:          stream,
+			Success:         false,
+			ResponseStatus:  upstreamResp.StatusCode,
+			RequestJSON:     string(requestBody),
+			ResponseHeaders: marshalHeaders(upstreamResp.Header),
+			ResponseBody:    string(responseBody),
+			ErrorText:       errorString(readErr),
+		})
+		if readErr != nil {
+			s.debugf("request %s failed reading retry response from %s: %v", requestID, serverURL, readErr)
+			lastErr = readErr
+			continue
+		}
+		s.debugf("request %s retrying after status %d from %s", requestID, upstreamResp.StatusCode, serverURL)
+		lastErr = fmt.Errorf("upstream status %d", upstreamResp.StatusCode)
 	}
 
-	return nil, lastErr
+	return nil, "", lastErr
 }
 
 func shouldRetryStatus(statusCode int) bool {
@@ -288,27 +375,27 @@ func validateStreamOptions(body json.RawMessage) error {
 	return nil
 }
 
-func proxyJSONResponse(w http.ResponseWriter, resp *http.Response, requestedModel string) error {
+func proxyJSONResponse(w http.ResponseWriter, resp *http.Response, requestedModel string) ([]byte, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	rewritten, err := rewriteResponseModel(body, requestedModel)
 	if err != nil {
-		return err
+		return body, err
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(rewritten)
-	return nil
+	return rewritten, nil
 }
 
-func proxyStreamResponse(w http.ResponseWriter, resp *http.Response, requestedModel string) error {
+func proxyStreamResponse(w http.ResponseWriter, resp *http.Response, requestedModel string) ([]byte, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("streaming unsupported")
+		return nil, fmt.Errorf("streaming unsupported")
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -318,25 +405,27 @@ func proxyStreamResponse(w http.ResponseWriter, resp *http.Response, requestedMo
 	w.WriteHeader(resp.StatusCode)
 
 	reader := bufio.NewReader(resp.Body)
+	var captured bytes.Buffer
 	for {
 		line, err := reader.ReadString('\n')
 		if len(line) > 0 {
 			rewritten, rewriteErr := rewriteSSELine(line, requestedModel)
 			if rewriteErr != nil {
-				return rewriteErr
+				return captured.Bytes(), rewriteErr
 			}
 
+			captured.WriteString(rewritten)
 			if _, writeErr := io.WriteString(w, rewritten); writeErr != nil {
-				return writeErr
+				return captured.Bytes(), writeErr
 			}
 			flusher.Flush()
 		}
 
 		if errors.Is(err, io.EOF) {
-			return nil
+			return captured.Bytes(), nil
 		}
 		if err != nil {
-			return err
+			return captured.Bytes(), err
 		}
 	}
 }
@@ -400,6 +489,48 @@ func copyResponseHeaders(dst, src http.Header) {
 
 func joinURL(baseURL, path string) string {
 	return strings.TrimRight(baseURL, "/") + path
+}
+
+func marshalHeaders(headers http.Header) string {
+	if len(headers) == 0 {
+		return ""
+	}
+
+	body, err := json.Marshal(headers)
+	if err != nil {
+		return ""
+	}
+
+	return string(body)
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	return err.Error()
+}
+
+func newRequestID() string {
+	return fmt.Sprintf("req-%d", time.Now().UnixNano())
+}
+
+func (s *Service) logAttempt(ctx context.Context, entry LogEntry) {
+	if s.repo == nil {
+		return
+	}
+
+	s.debugf("log attempt request=%s server=%s success=%t status=%d", entry.RequestID, entry.ServerURL, entry.Success, entry.ResponseStatus)
+	_ = s.repo.InsertLog(ctx, entry)
+}
+
+func (s *Service) debugf(format string, args ...any) {
+	if !s.debug {
+		return
+	}
+
+	log.Printf("DEBUG chat: "+format, args...)
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {

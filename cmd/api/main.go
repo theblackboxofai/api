@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -31,6 +32,10 @@ func main() {
 		log.Fatalf("ping database: %v", err)
 	}
 
+	if err := applySchema(ctx, db, cfg.SchemaPath); err != nil {
+		log.Fatalf("apply schema: %v", err)
+	}
+
 	repo := models.NewPostgresRepository(db)
 	mapper, err := models.LoadModelMapper(cfg.ModelMapPath)
 	if err != nil {
@@ -39,6 +44,8 @@ func main() {
 
 	modelService := models.NewService(repo, cfg.ModelsOwner, mapper)
 	chatService := chat.NewService(chat.NewPostgresRepository(db), mapper)
+	modelService.WithDebug(cfg.Debug)
+	chatService.WithDebug(cfg.Debug)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -54,9 +61,11 @@ func main() {
 
 type config struct {
 	DatabaseURL string
+	Debug       bool
 	ModelMapPath string
 	ModelsOwner string
 	Port        string
+	SchemaPath  string
 }
 
 func loadConfig() config {
@@ -80,17 +89,46 @@ func loadConfig() config {
 		modelMapPath = "maps.yml"
 	}
 
+	schemaPath := os.Getenv("SCHEMA_FILE")
+	if schemaPath == "" {
+		schemaPath = "sql/schema.sql"
+	}
+
+	debug := parseBoolEnv(os.Getenv("DEBUG"))
+
 	return config{
 		DatabaseURL: databaseURL,
+		Debug:       debug,
 		ModelMapPath: filepath.Clean(modelMapPath),
 		ModelsOwner: modelsOwner,
 		Port:        port,
+		SchemaPath:  filepath.Clean(schemaPath),
+	}
+}
+
+func parseBoolEnv(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 
 func newRouter(modelService *models.Service, chatService *chat.Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/models", models.NewHandler(modelService))
+	mux.Handle("/v1/stats", models.NewStatsHandler(modelService))
 	mux.HandleFunc("/v1/chat/completions", chatService.HandleCompletions)
 	return mux
+}
+
+func applySchema(ctx context.Context, db *sql.DB, schemaPath string) error {
+	schemaSQL, err := os.ReadFile(schemaPath)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.ExecContext(ctx, string(schemaSQL))
+	return err
 }
