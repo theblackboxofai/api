@@ -143,7 +143,7 @@ func (s *Service) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.debugf("server selection failed for %q: %v", rawModelID, err)
 		if err == errModelUnavailable {
-			writeError(w, http.StatusNotFound, "invalid_request_error", "requested model is not available")
+			writeError(w, http.StatusBadRequest, "server_unavailable", "no servers available for requested model")
 			return
 		}
 
@@ -215,7 +215,7 @@ func (s *Service) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var errModelUnavailable = fmt.Errorf("model unavailable")
+var errModelUnavailable = fmt.Errorf("no servers available")
 
 func (s *Service) pickServers(ctx context.Context, rawModelID string) ([]string, error) {
 	servers, err := s.repo.ListCandidateServers(ctx, rawModelID)

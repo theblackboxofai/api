@@ -25,6 +25,13 @@ WITH recent_model_servers AS (
   JOIN server_models sm ON sm.server_scan_id = ss.id
   WHERE ss.scanned_at >= NOW() - INTERVAL '24 hours'
     AND COALESCE(NULLIF(sm.model, ''), sm.name) LIKE '%' || $1 || '%'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM logs l
+      WHERE l.server_url = ss.server_url
+        AND l.success = FALSE
+        AND l.created_at >= NOW() - INTERVAL '6 hours'
+    )
   ORDER BY ss.server_url, COALESCE(NULLIF(sm.model, ''), sm.name), ss.scanned_at DESC, ss.id DESC
 )
 SELECT model_id, COUNT(*) AS server_count

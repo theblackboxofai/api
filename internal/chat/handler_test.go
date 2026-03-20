@@ -29,6 +29,38 @@ func TestHandlerRejectsUnknownModel(t *testing.T) {
 	}
 }
 
+func TestHandlerReturnsServiceUnavailableWhenNoServersRemainAfterFiltering(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeRepository{}
+	service := NewService(repo, models.StaticModelMapper{})
+
+	attempts := 0
+	service.client = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			return nil, context.DeadlineExceeded
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alpha:cloud","messages":[]}`))
+	rec := httptest.NewRecorder()
+
+	service.HandleCompletions(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+
+	if !strings.Contains(rec.Body.String(), "no servers available for requested model") {
+		t.Fatalf("expected no servers error, got %q", rec.Body.String())
+	}
+
+	if attempts != 0 {
+		t.Fatalf("expected zero upstream attempts, got %d", attempts)
+	}
+}
+
 func TestHandlerRejectsUnsupportedField(t *testing.T) {
 	t.Parallel()
 
