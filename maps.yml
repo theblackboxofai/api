@@ -1,0 +1,10 @@
+models:
+  "deepseek-v3.2:cloud": "deepseek/deepseek-v3.2"
+  "gemini-3-flash-preview:cloud": "google/gemini-3-flash-preview"
+  "glm-5:cloud": "z-ai/glm-5"
+  "kimi-k2.5:cloud": "moonshotai/kimi-k2.5"
+  "minimax-m2.5:cloud": "minimax/minimax-m2.5"
+  "minimax-m2.7:cloud": "minimax/minimax-m2.7"
+  "minimax-m2:cloud": "minimax/minimax-m2"
+  "qwen3.5:cloud": "qwen/qwen3.5"
+  "qwen3-coder-next:cloud": "qwen/qwen3-coder-next"
