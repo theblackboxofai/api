@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -132,7 +131,7 @@ func (s *Service) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rawModelID, ok := s.mapper.LookupRaw(request.Model)
-	if !ok || !strings.Contains(rawModelID, models.CloudTag) {
+	if !ok {
 		s.debugf("requested model %q not available", request.Model)
 		writeError(w, http.StatusNotFound, "invalid_request_error", "requested model is not available")
 		return
@@ -227,9 +226,9 @@ func (s *Service) pickServers(ctx context.Context, rawModelID string) ([]string,
 		return nil, errModelUnavailable
 	}
 
-	shuffled := shuffleServers(servers)
-	s.debugf("selected %d candidate servers for %q", len(shuffled), rawModelID)
-	return shuffled, nil
+	ordered := uniqueServers(servers)
+	s.debugf("selected %d ranked candidate servers for %q", len(ordered), rawModelID)
+	return ordered, nil
 }
 
 func rewriteRequestModel(body []byte, rawModelID string) ([]byte, error) {
@@ -245,9 +244,15 @@ func rewriteRequestModel(body []byte, rawModelID string) ([]byte, error) {
 
 func (s *Service) doUpstreamRequest(ctx context.Context, serverURLs []string, requestHeaders http.Header, requestBody, upstreamBody []byte, requestID, requestedModel, rawModelID string, stream bool) (*http.Response, string, error) {
 	var lastErr error
+	triedServers := make(map[string]struct{}, len(serverURLs))
+	pendingServers := uniqueServers(serverURLs)
 
-	for i, serverURL := range serverURLs {
-		s.debugf("request %s upstream attempt %d/%d server=%s", requestID, i+1, len(serverURLs), serverURL)
+	for attempt := 0; len(pendingServers) > 0; attempt++ {
+		serverURL := pendingServers[0]
+		pendingServers = pendingServers[1:]
+		triedServers[serverURL] = struct{}{}
+
+		s.debugf("request %s upstream attempt %d server=%s", requestID, attempt+1, serverURL)
 		upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(serverURL, ollamaChatCompletionsPath), bytes.NewReader(upstreamBody))
 		if err != nil {
 			return nil, "", err
@@ -273,6 +278,7 @@ func (s *Service) doUpstreamRequest(ctx context.Context, serverURLs []string, re
 				ErrorText:      err.Error(),
 			})
 			lastErr = err
+			pendingServers = s.refreshRetryCandidates(ctx, rawModelID, triedServers)
 			continue
 		}
 
@@ -281,7 +287,7 @@ func (s *Service) doUpstreamRequest(ctx context.Context, serverURLs []string, re
 			return upstreamResp, serverURL, nil
 		}
 
-		if !shouldRetryStatus(upstreamResp.StatusCode) || i == len(serverURLs)-1 {
+		if !shouldRetryStatus(upstreamResp.StatusCode) {
 			s.debugf("request %s returning non-retryable/final status %d from %s", requestID, upstreamResp.StatusCode, serverURL)
 			return upstreamResp, serverURL, nil
 		}
@@ -304,13 +310,35 @@ func (s *Service) doUpstreamRequest(ctx context.Context, serverURLs []string, re
 		if readErr != nil {
 			s.debugf("request %s failed reading retry response from %s: %v", requestID, serverURL, readErr)
 			lastErr = readErr
+			pendingServers = s.refreshRetryCandidates(ctx, rawModelID, triedServers)
 			continue
 		}
 		s.debugf("request %s retrying after status %d from %s", requestID, upstreamResp.StatusCode, serverURL)
 		lastErr = fmt.Errorf("upstream status %d", upstreamResp.StatusCode)
+		pendingServers = s.refreshRetryCandidates(ctx, rawModelID, triedServers)
 	}
 
 	return nil, "", lastErr
+}
+
+func (s *Service) refreshRetryCandidates(ctx context.Context, rawModelID string, triedServers map[string]struct{}) []string {
+	servers, err := s.pickServers(ctx, rawModelID)
+	if err != nil {
+		if err != errModelUnavailable {
+			s.debugf("retry candidate refresh failed for %q: %v", rawModelID, err)
+		}
+		return nil
+	}
+
+	filtered := make([]string, 0, len(servers))
+	for _, serverURL := range uniqueServers(servers) {
+		if _, seen := triedServers[serverURL]; seen {
+			continue
+		}
+		filtered = append(filtered, serverURL)
+	}
+
+	return filtered
 }
 
 func shouldRetryStatus(statusCode int) bool {
@@ -325,13 +353,21 @@ func shouldRetryStatus(statusCode int) bool {
 	}
 }
 
-func shuffleServers(servers []string) []string {
-	shuffled := append([]string(nil), servers...)
-	for i := len(shuffled) - 1; i > 0; i-- {
-		j := rand.IntN(i + 1)
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+func uniqueServers(servers []string) []string {
+	seen := make(map[string]struct{}, len(servers))
+	unique := make([]string, 0, len(servers))
+	for _, server := range servers {
+		if server == "" {
+			continue
+		}
+		if _, ok := seen[server]; ok {
+			continue
+		}
+		seen[server] = struct{}{}
+		unique = append(unique, server)
 	}
-	return shuffled
+
+	return unique
 }
 
 func validateChatCompletionRequest(body []byte) (chatCompletionRequest, error) {

@@ -11,7 +11,7 @@ SELECT
   MAX(COALESCE(sm.modified_at, ss.scanned_at)) AS created_at
 FROM server_models sm
 JOIN server_scans ss ON ss.id = sm.server_scan_id
-WHERE COALESCE(NULLIF(sm.model, ''), sm.name) LIKE '%' || $1 || '%'
+WHERE sm.raw_json ->> 'remote_host' = $1
 GROUP BY COALESCE(NULLIF(sm.model, ''), sm.name)
 ORDER BY COALESCE(NULLIF(sm.model, ''), sm.name);
 `
@@ -24,7 +24,7 @@ WITH recent_model_servers AS (
   FROM server_scans ss
   JOIN server_models sm ON sm.server_scan_id = ss.id
   WHERE ss.scanned_at >= NOW() - INTERVAL '24 hours'
-    AND COALESCE(NULLIF(sm.model, ''), sm.name) LIKE '%' || $1 || '%'
+    AND sm.raw_json ->> 'remote_host' = $1
     AND NOT EXISTS (
       SELECT 1
       FROM logs l
@@ -49,7 +49,7 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 }
 
 func (r *PostgresRepository) ListCloudModels(ctx context.Context) ([]Record, error) {
-	rows, err := r.db.QueryContext(ctx, listCloudModelsQuery, CloudTag)
+	rows, err := r.db.QueryContext(ctx, listCloudModelsQuery, OllamaRemoteHost)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +73,7 @@ func (r *PostgresRepository) ListCloudModels(ctx context.Context) ([]Record, err
 }
 
 func (r *PostgresRepository) ListCloudModelStats(ctx context.Context) ([]StatRecord, error) {
-	rows, err := r.db.QueryContext(ctx, listCloudModelStatsQuery, CloudTag)
+	rows, err := r.db.QueryContext(ctx, listCloudModelStatsQuery, OllamaRemoteHost)
 	if err != nil {
 		return nil, err
 	}

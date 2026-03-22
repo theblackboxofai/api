@@ -3,7 +3,11 @@ package chat
 import (
 	"context"
 	"database/sql"
+
+	"blackbox-api/internal/models"
 )
+
+const serverScoreStep = 0.025
 
 const listCandidateServersQuery = `
 WITH recent_servers AS (
@@ -14,18 +18,29 @@ WITH recent_servers AS (
   JOIN server_models sm ON sm.server_scan_id = ss.id
   WHERE ss.scanned_at >= NOW() - INTERVAL '24 hours'
     AND COALESCE(NULLIF(sm.model, ''), sm.name) = $1
-    AND NOT EXISTS (
-      SELECT 1
-      FROM logs l
-      WHERE l.server_url = ss.server_url
-        AND l.success = FALSE
-        AND l.created_at >= NOW() - INTERVAL '6 hours'
-    )
+    AND sm.raw_json ->> 'remote_host' = $2
   ORDER BY ss.server_url, ss.scanned_at DESC, ss.id DESC
+),
+server_scores AS (
+  SELECT
+    l.server_url,
+    1.0::double precision + COALESCE(SUM((CASE WHEN l.success THEN 1 ELSE -1 END) * $3::double precision), 0.0) AS score
+  FROM logs l
+  GROUP BY l.server_url
+),
+recent_request_load AS (
+  SELECT
+    l.server_url,
+    COUNT(*) AS request_count
+  FROM logs l
+  WHERE l.created_at >= NOW() - INTERVAL '1 minute'
+  GROUP BY l.server_url
 )
-SELECT server_url
-FROM recent_servers
-ORDER BY server_url;
+SELECT rs.server_url
+FROM recent_servers rs
+LEFT JOIN server_scores sc ON sc.server_url = rs.server_url
+LEFT JOIN recent_request_load rl ON rl.server_url = rs.server_url
+ORDER BY (COALESCE(sc.score, 1.0::double precision) - COALESCE(rl.request_count, 0)::double precision * $3::double precision) DESC, rs.scanned_at DESC, rs.server_url;
 `
 
 const insertLogQuery = `
@@ -55,7 +70,7 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 }
 
 func (r *PostgresRepository) ListCandidateServers(ctx context.Context, rawModelID string) ([]string, error) {
-	rows, err := r.db.QueryContext(ctx, listCandidateServersQuery, rawModelID)
+	rows, err := r.db.QueryContext(ctx, listCandidateServersQuery, rawModelID, models.OllamaRemoteHost, serverScoreStep)
 	if err != nil {
 		return nil, err
 	}

@@ -9,13 +9,13 @@ import (
 	"time"
 )
 
-func TestHandlerReturnsOpenAIListShapeAndFiltersNonCloudModels(t *testing.T) {
+func TestHandlerReturnsOpenAIListShapeForRepositorySelectedModels(t *testing.T) {
 	t.Parallel()
 
 	repo := fakeRepository{
 		records: []Record{
 			{ID: "alpha:cloud", CreatedAt: time.Unix(1700000000, 0).UTC()},
-			{ID: "beta", CreatedAt: time.Unix(1700000100, 0).UTC()},
+			{ID: "", CreatedAt: time.Unix(1700000100, 0).UTC()},
 			{ID: "gamma:cloud", CreatedAt: time.Unix(1700000200, 0).UTC()},
 		},
 	}
@@ -49,7 +49,7 @@ func TestHandlerReturnsOpenAIListShapeAndFiltersNonCloudModels(t *testing.T) {
 	}
 
 	if len(response.Data) != 2 {
-		t.Fatalf("expected 2 cloud models, got %d", len(response.Data))
+		t.Fatalf("expected 2 models, got %d", len(response.Data))
 	}
 
 	if response.Data[0].ID != "provider/alpha" {
@@ -79,7 +79,7 @@ func TestStatsHandlerReturnsMappedServerCounts(t *testing.T) {
 	repo := fakeRepository{
 		stats: []StatRecord{
 			{ID: "alpha:cloud", ServerCount: 3},
-			{ID: "beta", ServerCount: 99},
+			{ID: "", ServerCount: 99},
 			{ID: "gamma:cloud", ServerCount: 1},
 		},
 	}
@@ -109,7 +109,7 @@ func TestStatsHandlerReturnsMappedServerCounts(t *testing.T) {
 	}
 
 	if len(response.Data) != 2 {
-		t.Fatalf("expected 2 cloud stats, got %d", len(response.Data))
+		t.Fatalf("expected 2 stats entries, got %d", len(response.Data))
 	}
 
 	if response.Data[0].ID != "provider/alpha" || response.Data[0].ServerCount != 3 {

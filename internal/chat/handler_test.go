@@ -334,11 +334,34 @@ func TestCopyRequestHeadersSetsBlackboxUserAgent(t *testing.T) {
 	}
 }
 
+func TestPickServersPreservesRepositoryRanking(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeRepository{servers: []string{"http://server-b", "http://server-a", "http://server-c"}}
+	service := NewService(repo, models.StaticModelMapper{})
+
+	servers, err := service.pickServers(context.Background(), "alpha:cloud")
+	if err != nil {
+		t.Fatalf("pickServers: %v", err)
+	}
+
+	expected := []string{"http://server-b", "http://server-a", "http://server-c"}
+	if len(servers) != len(expected) {
+		t.Fatalf("expected %d servers, got %d", len(expected), len(servers))
+	}
+
+	for i := range expected {
+		if servers[i] != expected[i] {
+			t.Fatalf("expected ranked server %d to be %q, got %q", i, expected[i], servers[i])
+		}
+	}
+}
+
 func TestDoUpstreamRequestRetriesAnotherServerOnFailure(t *testing.T) {
 	t.Parallel()
 
 	var calls []string
-	repo := &fakeRepository{}
+	repo := &fakeRepository{servers: []string{"http://server-a", "http://server-b"}}
 	service := NewService(repo, models.StaticModelMapper{})
 	service.client = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -400,7 +423,7 @@ func TestDoUpstreamRequestRetriesAfterTransportError(t *testing.T) {
 	t.Parallel()
 
 	attempts := 0
-	repo := &fakeRepository{}
+	repo := &fakeRepository{servers: []string{"http://server-a", "http://server-b"}}
 	service := NewService(repo, models.StaticModelMapper{})
 	service.client = &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -430,6 +453,56 @@ func TestDoUpstreamRequestRetriesAfterTransportError(t *testing.T) {
 
 	if len(repo.logs) != 1 || !strings.Contains(repo.logs[0].ErrorText, "deadline") {
 		t.Fatalf("expected transport failure log, got %#v", repo.logs)
+	}
+}
+
+func TestDoUpstreamRequestRefreshesCandidatesAfterFailure(t *testing.T) {
+	t.Parallel()
+
+	var calls []string
+	repo := &fakeRepository{
+		candidateLists: [][]string{
+			{"http://server-a", "http://server-b"},
+			{"http://server-a", "http://server-b"},
+		},
+	}
+	service := NewService(repo, models.StaticModelMapper{})
+	service.client = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls = append(calls, req.URL.String())
+			if strings.Contains(req.URL.Host, "server-a") {
+				return nil, context.DeadlineExceeded
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"id":"ok"}`)),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	resp, serverURL, err := service.doUpstreamRequest(context.Background(), []string{"http://server-a"}, http.Header{}, []byte(`{"model":"alpha:cloud"}`), []byte(`{"model":"alpha:cloud"}`), "req-1", "alpha:cloud", "alpha:cloud", false)
+	if err != nil {
+		t.Fatalf("doUpstreamRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if serverURL != "http://server-b" {
+		t.Fatalf("expected refreshed candidate server-b, got %q", serverURL)
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", len(calls))
+	}
+
+	if strings.Contains(calls[1], "server-a") {
+		t.Fatalf("expected second attempt to avoid server-a, got %#v", calls)
+	}
+
+	if repo.listCandidateCalls != 1 {
+		t.Fatalf("expected one candidate refresh after failure, got %d", repo.listCandidateCalls)
 	}
 }
 
@@ -472,14 +545,28 @@ func TestHandleCompletionsLogsSuccessfulRequest(t *testing.T) {
 }
 
 type fakeRepository struct {
-	mu      sync.Mutex
-	servers []string
-	logs    []LogEntry
-	err     error
+	mu                 sync.Mutex
+	servers            []string
+	candidateLists     [][]string
+	listCandidateCalls int
+	logs               []LogEntry
+	err                error
 }
 
 func (f *fakeRepository) ListCandidateServers(context.Context, string) ([]string, error) {
-	return f.servers, f.err
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(f.candidateLists) > 0 {
+		index := f.listCandidateCalls
+		if index >= len(f.candidateLists) {
+			index = len(f.candidateLists) - 1
+		}
+		f.listCandidateCalls++
+		return append([]string(nil), f.candidateLists[index]...), f.err
+	}
+
+	return append([]string(nil), f.servers...), f.err
 }
 
 func (f *fakeRepository) InsertLog(_ context.Context, entry LogEntry) error {

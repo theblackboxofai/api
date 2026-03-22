@@ -60,12 +60,12 @@ func main() {
 }
 
 type config struct {
-	DatabaseURL string
-	Debug       bool
+	DatabaseURL  string
+	Debug        bool
 	ModelMapPath string
-	ModelsOwner string
-	Port        string
-	SchemaPath  string
+	ModelsOwner  string
+	Port         string
+	SchemaPath   string
 }
 
 func loadConfig() config {
@@ -97,12 +97,12 @@ func loadConfig() config {
 	debug := parseBoolEnv(os.Getenv("DEBUG"))
 
 	return config{
-		DatabaseURL: databaseURL,
-		Debug:       debug,
+		DatabaseURL:  databaseURL,
+		Debug:        debug,
 		ModelMapPath: filepath.Clean(modelMapPath),
-		ModelsOwner: modelsOwner,
-		Port:        port,
-		SchemaPath:  filepath.Clean(schemaPath),
+		ModelsOwner:  modelsOwner,
+		Port:         port,
+		SchemaPath:   filepath.Clean(schemaPath),
 	}
 }
 

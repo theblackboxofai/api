@@ -3,11 +3,13 @@ package models
 import (
 	"context"
 	"log"
-	"strings"
 	"time"
 )
 
-const CloudTag = ":cloud"
+const (
+	CloudTag         = ":cloud"
+	OllamaRemoteHost = "https://ollama.com:443"
+)
 
 type Repository interface {
 	ListCloudModels(ctx context.Context) ([]Record, error)
@@ -110,7 +112,7 @@ func BuildListResponse(records []Record, owner string, mapper ModelMapper) ListR
 	data := make([]ModelObject, 0, len(records))
 
 	for _, record := range records {
-		if record.ID == "" || !strings.Contains(record.ID, CloudTag) {
+		if record.ID == "" {
 			continue
 		}
 
@@ -136,7 +138,7 @@ func BuildStatsResponse(records []StatRecord, mapper ModelMapper) StatsResponse 
 	data := make([]ModelStat, 0, len(records))
 
 	for _, record := range records {
-		if record.ID == "" || !strings.Contains(record.ID, CloudTag) {
+		if record.ID == "" {
 			continue
 		}
 
