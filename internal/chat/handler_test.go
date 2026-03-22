@@ -29,6 +29,36 @@ func TestHandlerRejectsUnknownModel(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsDisabledRawModel(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "maps.yml")
+	content := []byte("models:\n  \"alpha:cloud\": \"\"\n")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write test map: %v", err)
+	}
+
+	mapper, err := models.LoadModelMapper(path)
+	if err != nil {
+		t.Fatalf("load mapper: %v", err)
+	}
+
+	service := NewService(&fakeRepository{}, mapper)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alpha:cloud","messages":[]}`))
+	rec := httptest.NewRecorder()
+
+	service.HandleCompletions(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+
+	if !strings.Contains(rec.Body.String(), "requested model is not available") {
+		t.Fatalf("expected unavailable model error, got %q", rec.Body.String())
+	}
+}
+
 func TestHandlerReturnsServiceUnavailableWhenNoServersRemainAfterFiltering(t *testing.T) {
 	t.Parallel()
 

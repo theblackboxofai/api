@@ -53,7 +53,7 @@ func LoadModelMapper(path string) (ModelMapper, error) {
 }
 
 func (m StaticModelMapper) Resolve(rawID string) string {
-	if mapped, ok := m.models[rawID]; ok && mapped != "" {
+	if mapped, ok := m.models[rawID]; ok {
 		return mapped
 	}
 
@@ -66,6 +66,10 @@ func (m StaticModelMapper) LookupRaw(modelID string) (string, bool) {
 	}
 
 	if strings.Contains(modelID, CloudTag) {
+		if mapped, ok := m.models[modelID]; ok && mapped == "" {
+			return "", false
+		}
+
 		return modelID, true
 	}
 

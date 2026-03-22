@@ -40,6 +40,31 @@ func TestLoadModelMapper(t *testing.T) {
 	}
 }
 
+func TestLoadModelMapperExplicitEmptyMappingDisablesModel(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "maps.yml")
+	content := []byte("models:\n  \"alpha:cloud\": \"\"\n")
+
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write test map: %v", err)
+	}
+
+	mapper, err := LoadModelMapper(path)
+	if err != nil {
+		t.Fatalf("load mapper: %v", err)
+	}
+
+	if got := mapper.Resolve("alpha:cloud"); got != "" {
+		t.Fatalf("expected disabled model to resolve to empty id, got %q", got)
+	}
+
+	if _, ok := mapper.LookupRaw("alpha:cloud"); ok {
+		t.Fatal("expected disabled raw model to be unavailable")
+	}
+}
+
 func TestLoadModelMapperMissingFileFallsBackToRawIDs(t *testing.T) {
 	t.Parallel()
 

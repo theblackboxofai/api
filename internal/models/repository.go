@@ -3,6 +3,7 @@ package models
 import (
 	"context"
 	"database/sql"
+	"time"
 )
 
 const listCloudModelsQuery = `
@@ -38,6 +39,17 @@ SELECT model_id, COUNT(*) AS server_count
 FROM recent_model_servers
 GROUP BY model_id
 ORDER BY model_id;
+`
+
+const listRequestHistoryQuery = `
+SELECT
+  created_at,
+  request_id,
+  success,
+  response_body
+FROM logs
+WHERE created_at >= $1
+ORDER BY created_at DESC, id DESC;
 `
 
 type PostgresRepository struct {
@@ -84,6 +96,34 @@ func (r *PostgresRepository) ListCloudModelStats(ctx context.Context) ([]StatRec
 		var record StatRecord
 		if err := rows.Scan(&record.ID, &record.ServerCount); err != nil {
 			return nil, err
+		}
+
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return records, nil
+}
+
+func (r *PostgresRepository) ListRequestHistory(ctx context.Context, since time.Time) ([]RequestHistoryRecord, error) {
+	rows, err := r.db.QueryContext(ctx, listRequestHistoryQuery, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []RequestHistoryRecord
+	for rows.Next() {
+		var record RequestHistoryRecord
+		var responseBody sql.NullString
+		if err := rows.Scan(&record.CreatedAt, &record.RequestID, &record.Success, &responseBody); err != nil {
+			return nil, err
+		}
+		if responseBody.Valid {
+			record.ResponseBody = responseBody.String
 		}
 
 		records = append(records, record)

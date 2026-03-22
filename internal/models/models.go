@@ -14,6 +14,7 @@ const (
 type Repository interface {
 	ListCloudModels(ctx context.Context) ([]Record, error)
 	ListCloudModelStats(ctx context.Context) ([]StatRecord, error)
+	ListRequestHistory(ctx context.Context, since time.Time) ([]RequestHistoryRecord, error)
 }
 
 type Service struct {
@@ -33,14 +34,22 @@ type StatRecord struct {
 	ServerCount int
 }
 
+type RequestHistoryRecord struct {
+	CreatedAt    time.Time
+	RequestID    string
+	Success      bool
+	ResponseBody string
+}
+
 type ListResponse struct {
 	Object string        `json:"object"`
 	Data   []ModelObject `json:"data"`
 }
 
 type StatsResponse struct {
-	Object string      `json:"object"`
-	Data   []ModelStat `json:"data"`
+	Object         string                `json:"object"`
+	Models         StatsModelsSection    `json:"models"`
+	RequestHistory RequestHistorySection `json:"request_history"`
 }
 
 type ModelObject struct {
@@ -53,6 +62,27 @@ type ModelObject struct {
 type ModelStat struct {
 	ID          string `json:"id"`
 	ServerCount int    `json:"server_count"`
+}
+
+type StatsModelsSection struct {
+	Object string      `json:"object"`
+	Data   []ModelStat `json:"data"`
+}
+
+type RequestHistorySection struct {
+	Last24Hours RequestHistoryWindow `json:"last_24_hours"`
+	Last7Days   RequestHistoryWindow `json:"last_7_days"`
+	Last28Days  RequestHistoryWindow `json:"last_28_days"`
+}
+
+type RequestHistoryWindow struct {
+	RequestCount     int64 `json:"request_count"`
+	AttemptCount     int64 `json:"attempt_count"`
+	SuccessCount     int64 `json:"success_count"`
+	FailureCount     int64 `json:"failure_count"`
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
 }
 
 func NewService(repo Repository, owner string, mapper ModelMapper) *Service {
@@ -86,14 +116,23 @@ func (s *Service) ListModels(ctx context.Context) (ListResponse, error) {
 
 func (s *Service) ListStats(ctx context.Context) (StatsResponse, error) {
 	s.debugf("listing model stats")
-	records, err := s.repo.ListCloudModelStats(ctx)
+	now := time.Now().UTC()
+	modelRecords, err := s.repo.ListCloudModelStats(ctx)
 	if err != nil {
 		s.debugf("list stats failed: %v", err)
 		return StatsResponse{}, err
 	}
-	s.debugf("loaded %d stats records", len(records))
+	s.debugf("loaded %d model stats records", len(modelRecords))
 
-	return BuildStatsResponse(records, s.mapper), nil
+	historySince := now.Add(-28 * 24 * time.Hour)
+	historyRecords, err := s.repo.ListRequestHistory(ctx, historySince)
+	if err != nil {
+		s.debugf("list request history failed: %v", err)
+		return StatsResponse{}, err
+	}
+	s.debugf("loaded %d request history records", len(historyRecords))
+
+	return BuildStatsResponse(modelRecords, historyRecords, s.mapper, now), nil
 }
 
 func (s *Service) debugf(format string, args ...any) {
@@ -116,8 +155,13 @@ func BuildListResponse(records []Record, owner string, mapper ModelMapper) ListR
 			continue
 		}
 
+		modelID := mapper.Resolve(record.ID)
+		if modelID == "" {
+			continue
+		}
+
 		data = append(data, ModelObject{
-			ID:      mapper.Resolve(record.ID),
+			ID:      modelID,
 			Object:  "model",
 			Created: record.CreatedAt.Unix(),
 			OwnedBy: owner,
@@ -130,7 +174,7 @@ func BuildListResponse(records []Record, owner string, mapper ModelMapper) ListR
 	}
 }
 
-func BuildStatsResponse(records []StatRecord, mapper ModelMapper) StatsResponse {
+func BuildStatsResponse(records []StatRecord, historyRecords []RequestHistoryRecord, mapper ModelMapper, now time.Time) StatsResponse {
 	if mapper == nil {
 		mapper = StaticModelMapper{}
 	}
@@ -142,14 +186,23 @@ func BuildStatsResponse(records []StatRecord, mapper ModelMapper) StatsResponse 
 			continue
 		}
 
+		modelID := mapper.Resolve(record.ID)
+		if modelID == "" {
+			continue
+		}
+
 		data = append(data, ModelStat{
-			ID:          mapper.Resolve(record.ID),
+			ID:          modelID,
 			ServerCount: record.ServerCount,
 		})
 	}
 
 	return StatsResponse{
-		Object: "list",
-		Data:   data,
+		Object: "stats",
+		Models: StatsModelsSection{
+			Object: "list",
+			Data:   data,
+		},
+		RequestHistory: BuildRequestHistory(historyRecords, now),
 	}
 }
